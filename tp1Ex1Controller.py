@@ -10,11 +10,11 @@ from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
 
 
-class SimpleSwitch(app_manager.RyuApp):
+class SwitchL2(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_0.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
-        super(SimpleSwitch, self).__init__(*args, **kwargs)
+        super(SwitchL2, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
 
     def add_flow(self, datapath, in_port, dst, src, actions):
@@ -88,4 +88,4 @@ class SimpleSwitch(app_manager.RyuApp):
         elif reason == ofproto.OFPPR_MODIFY:
             self.logger.info("port modified %s", port_no)
         else:
-            self.logger.info("Illeagal port state %s %s", port_no, reason)
+            self.logger.info("Ilegal port state %s %s", port_no, reason)
