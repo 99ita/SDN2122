@@ -4,8 +4,12 @@ class Ex2Topo(Topo):
     "Ex2 topology."
 
     def build(self):
-        #Add hosts and switches
+        #Add hosts and switches()
+
+        args = {}
         switchL3 = self.addSwitch('sL3')
+
+        
 
 
         switchL2_1 = self.addSwitch('sL2_1')
@@ -22,6 +26,7 @@ class Ex2Topo(Topo):
         host7 = self.addHost('h7',ip="10.0.3.1/24")
         host8 = self.addHost('h8',ip="10.0.3.2/24")
         host9 = self.addHost('h9',ip="10.0.3.3/24")
+        
         
         #Add links
         self.addLink(switchL3, switchL2_1, delay='5ms')
