@@ -1,15 +1,16 @@
 from mininet.topo import Topo
+from mininet.net import Mininet
+from mininet.cli import CLI
+from mininet.node import RemoteController
 
 class Ex2Topo(Topo):
-    "Ex2 topology."
 
     def build(self):
-        #Add hosts and switches()
-
-        args = {}
-        switchL3 = self.addSwitch('sL3')
 
         
+
+        #Add hosts and switches()
+        switchL3 = self.addSwitch('sL3')
 
 
         switchL2_1 = self.addSwitch('sL2_1')
@@ -44,6 +45,17 @@ class Ex2Topo(Topo):
         self.addLink(switchL2_3, host7)
         self.addLink(switchL2_3, host8)
         self.addLink(switchL2_3, host9, loss=10)
+
+        cL3 = net.addController(controller=RemoteController, ip = '127.0.0.1', port = 6633)
+        cL2 = net.addController(controller=RemoteController, ip = '127.0.0.1', port = 6634)
+
+        
+net = Mininet( topo=TreeTopo( depth=2, fanout=2 ),
+               controller=c0 )
+
+net.start()
+CLI( net )
+net.stop()
 
       
         
