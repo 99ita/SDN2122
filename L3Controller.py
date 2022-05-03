@@ -41,7 +41,7 @@ class SwitchL3(app_manager.RyuApp):
         self.router_ports = {}
         self.router_ports_to_ip = {1 : '10.0.1.20', 2 : '10.0.2.20', 3 : '10.0.3.20'}
         
-        self.packet_queue = []
+        self.packet_queue = {}
 
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -77,8 +77,6 @@ class SwitchL3(app_manager.RyuApp):
         for p in ev.msg.body:
             self.router_ports[dpid].update({ p.port_no: p.hw_addr})
         print(self.router_ports)
-
-
 
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
@@ -214,13 +212,51 @@ class SwitchL3(app_manager.RyuApp):
             else:
                 #Static routing handling
                 if pkt_ipv4.dst in self.ip_to_port.keys():
+                    self.logger.info("Packet received by router %s from %s to %s ", dpid, pkt_ipv4.src, pkt_ipv4.dst)
                     if pkt_ipv4.dst in self.ip_to_mac.keys():
+                        out_port = self.ip_to_port[pkt_ipv4.dst]
+                        pkt_ethernet.src = self.router_ports[dpid][out_port]
+                        pkt_ethernet.dst = self.ip_to_mac[dpid][pkt_ipv4.dst]
+                        
+                        
+                        return
+
+                    else:
+                        #Send ARP Request
+                        self.packet_queue.setdefault(pkt_ipv4.dst,[])
+                        self.packet_queue[pkt_ipv4.dst].append(msg)
+                        self.logger.info("Router %s doesn't know MAC of %s adding packet to queue", dpid, pkt_ipv4.dst)
+                        self.send_arp_request(msg, pkt_ethernet, pkt_ipv4)
                         return
 
                 else:
+                    self.logger.info("Packet received by router %s from %s to %s (unknown destination)", dpid, pkt_ipv4.src, pkt_ipv4.dst)
                     self.send_icmp_unreachable(msg, port, pkt_ethernet, pkt_ipv4)
                     #Send ICMP network unreachable
                    
+
+
+    def send_arp_request(self, msg, pkt_ethernet, pkt_ipv4):
+        out_port = self.ip_to_port[pkt_ipv4.dst]
+        src_mac = self.router_ports[msg.datapath.id][out_port]
+        src_ip = self.router_ports_to_ip[out_port]
+
+
+        pkt = packet.Packet()
+        pkt.add_protocol(ethernet.ethernet(ethertype=pkt_ethernet.ethertype,
+                                           dst='ff:ff:ff:ff:ff:ff',
+                                           src=src_mac))
+        pkt.add_protocol(arp.arp(opcode=arp.ARP_REQUEST,
+                                 src_mac=src_mac,
+                                 src_ip=src_ip,
+                                 dst_mac='ff:ff:ff:ff:ff:ff',
+                                 dst_ip=pkt_ipv4.dst))
+
+        self.send_packet(msg.datapath,out_port,pkt)
+
+        self.logger.info("Router %s sending ARP Request from port %s to learn MAC of %s", msg.datapath.id, out_port, pkt_ipv4.dst)
+
+
 
 
     def send_packet(self, datapath, port, pkt):
@@ -239,7 +275,7 @@ class SwitchL3(app_manager.RyuApp):
 
 
     def handle_arp(self, msg, port, pkt_ethernet, pkt_arp):
-        # ARP packet handling.
+        #ARP packet handling.
         dpid = msg.datapath.id
 
         if pkt_arp.dst_ip in self.router_ports_to_ip.values() and pkt_arp.opcode == arp.ARP_REQUEST:
@@ -322,6 +358,8 @@ class SwitchL3(app_manager.RyuApp):
                                     csum=0,
                                     data=icmp_data))
         self.send_packet(msg.datapath, port, pkt)
+
+        self.logger.info("Router %s sending ICMP Destination Unreachable to %s", msg.datapath.id, pkt_ipv4.src)
 
 
 
