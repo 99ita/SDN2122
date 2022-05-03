@@ -8,12 +8,14 @@ from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
 
 
+
 class SwitchL2(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
         super(SwitchL2, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
+        self.router_ports = {}
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -26,17 +28,31 @@ class SwitchL2(app_manager.RyuApp):
 
         self.add_flow(datapath, 0, match, actions)
 
-        match = parser.OFPMatch(eth_type= ether_types.ETH_TYPE_IPV6)
+        match = parser.OFPMatch(eth_type = ether_types.ETH_TYPE_IPV6)
         actions = []
 
         self.add_flow(datapath, 1, match, actions)
-
         self.port_desc(datapath)
 
 
-    
+
+    def port_desc(self, datapath):
+        ofparser = datapath.ofproto_parser
+
+        req = ofparser.OFPPortDescStatsRequest(datapath,0)
+        datapath.send_msg(req)
 
 
+
+
+    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
+    def port_desc_stats_reply_handle(self,ev):
+
+        dpid = ev.msg.datapath.id
+        self.router_ports.setdefault(dpid, {})
+        for p in ev.msg.body:
+            self.router_ports[dpid].update({ p.port_no: p.hw_addr})
+        print("abcd",self.router_ports)
 
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
@@ -70,10 +86,12 @@ class SwitchL2(app_manager.RyuApp):
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
+        
 
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             # ignore lldp packet
             return
+        
         dst = eth.dst
         src = eth.src
 

@@ -15,6 +15,7 @@ from ryu.lib.packet import packet
 from ryu.lib.packet import packet_base
 from ryu.lib.packet import tcp
 from ryu.lib.packet import udp
+from ryu.ofproto import ether
 
 ETHERNET = ethernet.ethernet.__name__
 IPV4 = ipv4.ipv4.__name__
@@ -37,6 +38,9 @@ class SwitchL3(app_manager.RyuApp):
         self.ip_to_port = {'10.0.1.1' : 1, '10.0.1.2' : 1, '10.0.1.3' : 1,
                            '10.0.2.1' : 2, '10.0.2.2' : 2, '10.0.2.3' : 2,
                            '10.0.3.1' : 3, '10.0.3.2' : 3, '10.0.3.3' : 3,}
+        self.router_ports = {}
+        self.router_ports_to_ip = {1 : '10.0.1.20', 2 : '10.0.2.20', 3 : '10.0.3.20'}
+        
         self.packet_queue = []
 
 
@@ -58,7 +62,6 @@ class SwitchL3(app_manager.RyuApp):
         self.port_desc(datapath)
 
 
-
     def port_desc(self, datapath):
         ofparser = datapath.ofproto_parser
 
@@ -66,13 +69,14 @@ class SwitchL3(app_manager.RyuApp):
         datapath.send_msg(req)
 
 
-
-
     @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
     def port_desc_stats_reply_handle(self,ev):
+
+        dpid = ev.msg.datapath.id
+        self.router_ports.setdefault(dpid, {})
         for p in ev.msg.body:
-            self.L3SMacs.update({ p.port_in: p.hw_addr})    #dict
-        print(self.L3SMacs)
+            self.router_ports[dpid].update({ p.port_no: p.hw_addr})
+        print(self.router_ports)
 
 
 
@@ -179,129 +183,147 @@ class SwitchL3(app_manager.RyuApp):
                                   in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)'''
 
+
+    
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
-    def packet_in_handler(self, msg):
+    def packet_in_handler(self, ev):
+        msg = ev.msg
+        datapath = msg.datapath
+        dpid = msg.datapath.id
         pkt = packet.Packet(msg.data)
-        header_list = dict((p.protocol_name, p)
-                           for p in pkt.protocols
-                           if isinstance(p, packet_base.PacketBase))
+        port = msg.match['in_port']
+        self.logger.info("packet-in %s" % (pkt,))
 
-        
-
-        # Analyze event type.
-        if ARP in header_list:
-            self.packetin_arp(msg, header_list)
+        pkt_ethernet = pkt.get_protocol(ethernet.ethernet)
+        if not pkt_ethernet:
             return
-
-        if IPV4 in header_list:
-            rt_ports = self.address_data.get_default_gw()
-            if header_list[IPV4].dst in rt_ports:
-                # Packet to router's port.
-                if ICMP in header_list:
-                    if header_list[ICMP].type == icmp.ICMP_ECHO_REQUEST:
-                        self._packetin_icmp_req(msg, header_list)
-                        return
-                elif TCP in header_list or UDP in header_list:
-                    self._packetin_tcp_udp(msg, header_list)
+        pkt_arp = pkt.get_protocol(arp.arp)
+        if pkt_arp:
+            #ARP handling
+            self.handle_arp(msg, datapath, port, pkt_ethernet, pkt_arp)
+            return
+        pkt_ipv4 = pkt.get_protocol(ipv4.ipv4)
+        if pkt_ipv4:
+            if pkt_ipv4.dst in self.router_ports_to_ip.values():
+                pkt_icmp = pkt.get_protocol(icmp.icmp)
+                if pkt_icmp:
+                    #ICMP handling
+                    self.handle_icmp(datapath, port, pkt_ethernet, pkt_ipv4, pkt_icmp)
                     return
             else:
-                # Packet to internal host or gateway router.
-                self._packetin_to_node(msg, header_list)
-                return
+                #Static routing handling
+                if pkt_ipv4.dst in self.ip_to_port.keys():
+                    if pkt_ipv4.dst in self.ip_to_mac.keys():
+                        return
 
-    def packetin_arp(self, msg, header_list):
-        src_addr = self.address_data.get_data(ip=header_list[ARP].src_ip)
-        if src_addr is None:
+                else:
+                    self.send_icmp_unreachable(msg, port, pkt_ethernet, pkt_ipv4)
+                    #Send ICMP network unreachable
+                   
+
+
+    def send_packet(self, datapath, port, pkt):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        pkt.serialize()
+        self.logger.info("packet-out %s" % (pkt,))
+        data = pkt.data
+        actions = [parser.OFPActionOutput(port=port)]
+        out = parser.OFPPacketOut(datapath=datapath,
+                                  buffer_id=ofproto.OFP_NO_BUFFER,
+                                  in_port=ofproto.OFPP_CONTROLLER,
+                                  actions=actions,
+                                  data=data)
+        datapath.send_msg(out)
+
+
+    def handle_arp(self, msg, port, pkt_ethernet, pkt_arp):
+        # ARP packet handling.
+        dpid = msg.datapath.id
+
+        if pkt_arp.dst_ip in self.router_ports_to_ip.values() and pkt_arp.opcode == arp.ARP_REQUEST:
+
+            self.logger.info("ARP Request received by router %s from %s in port %s ", dpid, pkt_arp.src_ip, port)
+
+            port_mac = self.router_ports[dpid][port]
+
+            pkt = packet.Packet()
+            pkt.add_protocol(ethernet.ethernet(ethertype=pkt_ethernet.ethertype,
+                                           dst=pkt_ethernet.src,
+                                           src=port_mac))
+            pkt.add_protocol(arp.arp(opcode=arp.ARP_REPLY,
+                                 src_mac=port_mac,
+                                 src_ip=pkt_arp.dst_ip,
+                                 dst_mac=pkt_arp.src_mac,
+                                 dst_ip=pkt_arp.src_ip))
+            self.send_packet(msg.datapath, port, pkt)
+
+            self.logger.info("ARP Reply sent by router %s from port %s with MAC %s to %s", dpid, port, port_mac, pkt_arp.src_ip)
+
+            return
+        elif pkt_arp.dst_ip in self.router_ports_to_ip.values() and pkt_arp.opcode == arp.ARP_REPLY:
+            self.logger.info("ARP Reply received by router %s from %s with MAC %s", port, pkt_arp.src_ip, pkt_arp.src_mac)
+            self.ip_to_mac.setdefault(dpid, {})
+            self.ip_to_mac[dpid][pkt_arp.src_ip] = pkt_arp.src_mac
+
+            #wake arp reply waiting thread
+            return
+        else:
+            #Any other case pass
             return
 
-        # case: Receive ARP from the gateway
-        #  Update routing table.
-        # case: Receive ARP from an internal host
-        #  Learning host MAC.
-        gw_flg = self._update_routing_tbl(msg, header_list)
-        if gw_flg is False:
-            self._learning_host_mac(msg, header_list)
 
-        # ARP packet handling.
-        in_port = self.ofctl.get_packetin_inport(msg)
-        src_ip = header_list[ARP].src_ip
-        dst_ip = header_list[ARP].dst_ip
-        srcip = ip_addr_ntoa(src_ip)
-        dstip = ip_addr_ntoa(dst_ip)
-        rt_ports = self.address_data.get_default_gw()
-
-        if src_ip == dst_ip:
-            # GARP -> packet forward (normal)
-            output = self.ofctl.dp.ofproto.OFPP_NORMAL
-            self.ofctl.send_packet_out(in_port, output, msg.data)
-
-            self.logger.info('Receive GARP from [%s].', srcip,
-                             extra=self.sw_id)
-            self.logger.info('Send GARP (normal).', extra=self.sw_id)
-
-        elif dst_ip not in rt_ports:
-            dst_addr = self.address_data.get_data(ip=dst_ip)
-            if (dst_addr is not None and
-                    src_addr.address_id == dst_addr.address_id):
-                # ARP from internal host -> packet forward (normal)
-                output = self.ofctl.dp.ofproto.OFPP_NORMAL
-                self.ofctl.send_packet_out(in_port, output, msg.data)
-
-                self.logger.info('Receive ARP from an internal host [%s].',
-                                 srcip, extra=self.sw_id)
-                self.logger.info('Send ARP (normal)', extra=self.sw_id)
-        else:
-            if header_list[ARP].opcode == arp.ARP_REQUEST:
-                # ARP request to router port -> send ARP reply
-                src_mac = self.port_data[in_port].mac
-                dst_mac = header_list[ARP].src_mac
-                arp_target_mac = dst_mac
-                output = in_port
-                in_port = self.ofctl.dp.ofproto.OFPP_CONTROLLER
-
-                self.ofctl.send_arp(arp.ARP_REPLY, self.vlan_id,
-                                    src_mac, dst_mac, dst_ip, src_ip,
-                                    arp_target_mac, in_port, output)
-
-                log_msg = 'Receive ARP request from [%s] to router port [%s].'
-                self.logger.info(log_msg, srcip, dstip, extra=self.sw_id)
-                self.logger.info('Send ARP reply to [%s]', srcip,
-                                 extra=self.sw_id)
-
-            elif header_list[ARP].opcode == arp.ARP_REPLY:
-                #  ARP reply to router port -> suspend packets forward
-                log_msg = 'Receive ARP reply from [%s] to router port [%s].'
-                self.logger.info(log_msg, srcip, dstip, extra=self.sw_id)
-
-                packet_list = self.packet_buffer.get_data(src_ip)
-                if packet_list:
-                    # stop ARP reply wait thread.
-                    for suspend_packet in packet_list:
-                        self.packet_buffer.delete(pkt=suspend_packet)
-
-                    # send suspend packet.
-                    output = self.ofctl.dp.ofproto.OFPP_TABLE
-                    for suspend_packet in packet_list:
-                        self.ofctl.send_packet_out(suspend_packet.in_port,
-                                                   output,
-                                                   suspend_packet.data)
-                        self.logger.info('Send suspend packet to [%s].',
-                                         srcip, extra=self.sw_id)
-
-    def _packetin_icmp_req(self, msg, header_list):
+    def hanlde_icmp(self, msg, port, pkt_ethernet, pkt_ipv4, pkt_icmp):
         # Send ICMP echo reply.
-        in_port = self.ofctl.get_packetin_inport(msg)
-        self.ofctl.send_icmp(in_port, header_list, self.vlan_id,
-                             icmp.ICMP_ECHO_REPLY,
-                             icmp.ICMP_ECHO_REPLY_CODE,
-                             icmp_data=header_list[ICMP].data)
 
-        srcip = ip_addr_ntoa(header_list[IPV4].src)
-        dstip = ip_addr_ntoa(header_list[IPV4].dst)
-        log_msg = 'Receive ICMP echo request from [%s] to router port [%s].'
-        self.logger.info(log_msg, srcip, dstip, extra=self.sw_id)
-        self.logger.info('Send ICMP echo reply to [%s].', srcip,
-                         extra=self.sw_id)
+        dpid = msg.datapath.id
+        src_ip = pkt_ipv4.src
+        self.logger.info('ICMP echo request received by router %s from %s to router port %s.', dpid, src_ip, port)
+        pkt = packet.Packet()
+        pkt.add_protocol(ethernet.ethernet(ethertype=pkt_ethernet.ethertype,
+                                           dst=pkt_ethernet.src,
+                                           src=self.router_ports[dpid][port]))
+        pkt.add_protocol(ipv4.ipv4(dst=pkt_ipv4.src,
+                                   src=self.router_ports_to_ip[port],
+                                   proto=pkt_ipv4.proto))
+        pkt.add_protocol(icmp.icmp(type_=icmp.ICMP_ECHO_REPLY,
+                                   code=icmp.ICMP_ECHO_REPLY_CODE,
+                                   csum=0,
+                                   data=pkt_icmp.data))
+        self.send_packet(msg.datapath, port, pkt)
+        self.logger.info('Send ICMP echo reply to [%s].', src_ip)
+
+
+    def send_icmp_unreachable(self, msg, port, pkt_ethernet, pkt_ipv4):
+        port_mac = self.router_ports[msg.datapath.id][port]
+
+        offset = ethernet.ethernet._MIN_LEN
+        end_of_data = offset + len(pkt_ipv4) + 128
+        ip_datagram = bytearray()
+        ip_datagram += msg.data[offset:end_of_data]
+        data_len = int(len(ip_datagram) / 4)
+        length_modulus = int(len(ip_datagram) % 4)
+        if length_modulus:
+            data_len += 1
+            ip_datagram += bytearray([0] * (4 - length_modulus))
+
+        icmp_data = icmp.dest_unreach(data_len=data_len, data=ip_datagram)
+
+        pkt = packet.Packet()
+        pkt.add_protocol(ethernet.ethernet(ethertype=pkt_ethernet.ethertype,
+                                            dst=pkt_ethernet.src,
+                                            src=port_mac))
+        pkt.add_protocol(ipv4.ipv4(dst=pkt_ipv4.src,
+                                    src=self.router_ports_to_ip[port],
+                                    proto=pkt_ipv4.proto))
+        pkt.add_protocol(icmp.icmp(type_=icmp.ICMP_DEST_UNREACH,
+                                    code=icmp.ICMP_HOST_UNREACH_CODE,
+                                    csum=0,
+                                    data=icmp_data))
+        self.send_packet(msg.datapath, port, pkt)
+
+
 
     def _packetin_tcp_udp(self, msg, header_list):
         # Send ICMP port unreach error.

@@ -7,7 +7,7 @@ class Ex1Topo( Topo ):
         "Create custom topo."
 
         # Add hosts and switches
-        switch = self.addSwitch( 's1' )
+        switch = self.addSwitch( 's1', dpid = '1' )
         firstHost = self.addHost( 'h1' )
         secondHost = self.addHost( 'h2' )
         thirdHost = self.addHost( 'h3' )
