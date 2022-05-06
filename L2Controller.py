@@ -35,14 +35,11 @@ class SwitchL2(app_manager.RyuApp):
         self.port_desc(datapath)
 
 
-
     def port_desc(self, datapath):
         ofparser = datapath.ofproto_parser
 
         req = ofparser.OFPPortDescStatsRequest(datapath,0)
         datapath.send_msg(req)
-
-
 
 
     @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
@@ -52,7 +49,13 @@ class SwitchL2(app_manager.RyuApp):
         self.router_ports.setdefault(dpid, {})
         for p in ev.msg.body:
             self.router_ports[dpid].update({ p.port_no: p.hw_addr})
-        print("abcd",self.router_ports)
+        
+        print("Router ",dpid)
+        for p in self.router_ports[dpid].keys():
+            print(f"Port {p} has MAC {self.router_ports[dpid][p]}")
+
+        print("\n")
+
 
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
@@ -98,7 +101,7 @@ class SwitchL2(app_manager.RyuApp):
         dpid = datapath.id
         self.mac_to_port.setdefault(dpid, {})
 
-        self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
+        self.logger.info("Packet in port %s switch LAN%s from %s to %s\n", in_port, dpid, src, dst)
 
         # learn a mac address to avoid FLOOD next time.
         self.mac_to_port[dpid][src] = in_port
