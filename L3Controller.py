@@ -5,7 +5,6 @@ from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ether_types
-from ryu.lib.packet import packet_base
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import arp
 from ryu.lib.packet import ethernet
@@ -207,6 +206,7 @@ class SwitchL3(app_manager.RyuApp):
             self.logger.info("ARP Reply sent by router %s from port %s with MAC %s to %s", dpid, port, port_mac, pkt_arp.src_ip)
 
             return
+
         elif pkt_arp.dst_ip in self.router_ports_to_ip.values() and pkt_arp.opcode == arp.ARP_REPLY:
             self.logger.info("\nARP Reply received by router %s from %s with MAC %s", dpid, pkt_arp.src_ip, pkt_arp.src_mac)
             self.ip_to_mac.setdefault(dpid, {})
@@ -235,6 +235,7 @@ class SwitchL3(app_manager.RyuApp):
 
     def handle_icmp(self, msg, port, pkt_ethernet, pkt_ipv4, pkt_icmp):
         # Send ICMP echo reply.
+        parser = msg.datapath.ofproto_parser
 
         dpid = msg.datapath.id
         src_ip = pkt_ipv4.src
@@ -252,6 +253,25 @@ class SwitchL3(app_manager.RyuApp):
                                    data=pkt_icmp.data))
         self.send_packet(msg.datapath, port, pkt)
         self.logger.info('Send ICMP echo reply to [%s].', src_ip)
+
+
+        match = parser.OFPMatch(in_port=port,
+                                eth_type=0x0800,
+                                ip_proto=pkt_ipv4.proto,
+                                ipv4_src=pkt_ipv4.src,
+                                ipv4_dst=pkt_ipv4.dst)
+
+        set_eth_src = parser.OFPActionSetField(eth_src=pkt_ethernet.dst)
+        set_eth_dst = parser.OFPActionSetField(eth_dst=pkt_ethernet.src)
+        set_ip_proto = parser.OFPActionSetField(ip_proto=0x01)
+        set_ip_src = parser.OFPActionSetField(ipv4_src=pkt_ipv4.dst)
+        set_ip_dst = parser.OFPActionSetField(ipv4_dst=pkt_ipv4.src)
+        set_icmp_type = parser.OFPActionSetField(icmpv4_type=0x00)
+        actions = [set_eth_src, set_eth_dst, set_ip_src, set_ip_dst, set_icmp_type, parser.OFPActionOutput(port)]
+        
+        self.add_flow(msg.datapath,2,match,actions)
+
+        self.logger.info('Added flow table entry!')
 
 
     def send_icmp_unreachable(self, msg, port, pkt_ethernet, pkt_ipv4):
