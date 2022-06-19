@@ -11,10 +11,11 @@ from ryu.lib.packet import ethernet
 from ryu.lib.packet import icmp
 from ryu.lib.packet import ipv4
 from ryu.lib.packet import packet
-from ryu.lib.packet import packet_base
 from ryu.lib.packet import tcp
 from ryu.lib.packet import udp
 from ryu.ofproto import ether
+import time
+import threading
 
 ETHERNET = ethernet.ethernet.__name__
 IPV4 = ipv4.ipv4.__name__
@@ -23,7 +24,11 @@ ICMP = icmp.icmp.__name__
 TCP = tcp.tcp.__name__
 UDP = udp.udp.__name__
 
+def apply_mask(ip):
+    ip = ip.split('.')
+    ip = ip[0] + '.' + ip[1] + '.' + ip[2]
 
+    return ip
 
 
 class SwitchL3(app_manager.RyuApp):
@@ -32,14 +37,78 @@ class SwitchL3(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(SwitchL3, self).__init__(*args, **kwargs)
         self.ip_to_mac = {}
-        self.ip_to_port = {'10.0.1.1' : 1, '10.0.1.2' : 1, '10.0.1.3' : 1,
-                           '10.0.2.1' : 2, '10.0.2.2' : 2, '10.0.2.3' : 2,
-                           '10.0.3.1' : 3, '10.0.3.2' : 3, '10.0.3.3' : 3,}
-        self.router_ports = {}
-        self.router_ports_to_ip = {1 : '10.0.1.20', 2 : '10.0.2.20', 3 : '10.0.3.20'}
+        self.ip_to_port = {17: {'10.0.1' : 3, '10.0.2' : 2, '10.0.3' : 2},
+                           18: {'10.0.1' : 1, '10.0.2' : 3, '10.0.3' : 2},
+                           19: {'10.0.1' : 1, '10.0.2' : 1, '10.0.3' : 3}}
+        self.router_ports_mac = {}
+        self.router_ports_state = {}
+        self.router_ports_to_ip = {17: {1 : '10.0.4.1', 2 : '10.0.6.2', 3 : '10.0.1.20'}, 
+                                   18: {1 : '10.0.4.2', 2 : '10.0.5.1', 3 : '10.0.2.20'}, 
+                                   19: {1 : '10.0.5.2', 2 : '10.0.6.1', 3 : '10.0.3.20'}}
         
         self.packet_queue = {}
+        self.links = {}
+        self.fst = True
 
+    def resolve_paths(self):
+        link12 = False
+        link23 = False
+        link31 = False
+        copydict = self.ip_to_port.copy()
+        try:
+            if self.router_ports_state[17][1] == 4 and self.router_ports_state[18][1] == 4:
+                link12 = True
+            if self.router_ports_state[18][2] == 4 and self.router_ports_state[19][1] == 4:
+                link23 = True
+            if self.router_ports_state[19][2] == 4 and self.router_ports_state[17][2] == 4:
+                link31 = True
+        except KeyError:
+            return
+
+        if not link12:
+            self.ip_to_port[17]['10.0.2'] = 2
+            self.ip_to_port[18]['10.0.1'] = 2
+        else:
+            self.ip_to_port[17]['10.0.2'] = 1
+            self.ip_to_port[18]['10.0.1'] = 1
+
+        if not link23:
+            self.ip_to_port[18]['10.0.3'] = 1
+            self.ip_to_port[19]['10.0.2'] = 2
+        else:
+            self.ip_to_port[18]['10.0.3'] = 2
+            self.ip_to_port[19]['10.0.2'] = 1
+
+        if not link31:
+            self.ip_to_port[17]['10.0.3'] = 1
+            self.ip_to_port[19]['10.0.1'] = 1
+        else:
+            self.ip_to_port[17]['10.0.3'] = 2
+            self.ip_to_port[19]['10.0.1'] = 2
+
+        changed = False
+        for k in copydict:
+            for key in copydict[k]:
+                if copydict[k][key] != self.ip_to_port[k][key]:
+                    changed = True
+                    break
+            if changed:
+                break
+
+
+        if changed or self.fst:
+            for k in self.ip_to_port.keys():
+                print(f"Router {k}")
+                for key in self.ip_to_port[k].keys():
+                    print(f"{key}.0 to port: {self.ip_to_port[k][key]}")
+                print("\n")
+            print("\n")
+            self.fst = False
+
+    def threaaa(self, datapath):
+        while True:
+            time.sleep(5)
+            self.port_desc(datapath)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -56,7 +125,11 @@ class SwitchL3(app_manager.RyuApp):
         actions = []
 
         self.add_flow(datapath, 1, match, actions)
-        self.port_desc(datapath)
+
+        t = threading.Thread(target=self.threaaa,args=(datapath,))
+        t.daemon = True
+        t.start()
+
 
 
     def port_desc(self, datapath):
@@ -70,15 +143,21 @@ class SwitchL3(app_manager.RyuApp):
     def port_desc_stats_reply_handle(self,ev):
 
         dpid = ev.msg.datapath.id
-        self.router_ports.setdefault(dpid, {})
-        for p in ev.msg.body:
-            self.router_ports[dpid].update({ p.port_no: p.hw_addr})
+        self.router_ports_mac.setdefault(dpid, {})
+        self.router_ports_state.setdefault(dpid, {})
         
-        print("Router ",dpid)
-        for p in self.router_ports[dpid].keys():
-            print(f"Port {p} has MAC {self.router_ports[dpid][p]}")
+        for p in ev.msg.body:
+            self.router_ports_mac[dpid].update({p.port_no: p.hw_addr})
+            self.router_ports_state[dpid].update({p.port_no: p.state})
 
-        print("\n")
+
+        self.resolve_paths()
+        
+        '''print("Router ",dpid)
+        for p in self.router_ports_mac[dpid].keys():
+            print(f"Port {p} has MAC {self.router_ports_mac[dpid][p]}")
+
+        print("\n")'''
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
@@ -96,7 +175,7 @@ class SwitchL3(app_manager.RyuApp):
         datapath.send_msg(mod)
  
 
-    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    #@set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
         dpid = msg.datapath.id        
@@ -115,19 +194,19 @@ class SwitchL3(app_manager.RyuApp):
             return
         pkt_ipv4 = pkt.get_protocol(ipv4.ipv4)
         if pkt_ipv4:
-            if pkt_ipv4.dst in self.router_ports_to_ip.values():
+            if pkt_ipv4.dst in self.router_ports_to_ip[dpid].values():
                 pkt_icmp = pkt.get_protocol(icmp.icmp)
                 if pkt_icmp:
                     self.handle_icmp(msg, port, pkt_ethernet, pkt_ipv4, pkt_icmp)
                     return
             else:
                 #Static routing handling
-                if pkt_ipv4.dst in self.ip_to_port.keys():
+                if apply_mask(pkt_ipv4.dst) in self.ip_to_port[dpid].keys():
                     self.logger.info("\nPacket received by router %s from %s to %s ", dpid, pkt_ipv4.src, pkt_ipv4.dst)
                     self.ip_to_mac.setdefault(dpid, {})
-                    if pkt_ipv4.dst in self.ip_to_mac[dpid].keys():
-                        out_port = self.ip_to_port[pkt_ipv4.dst]
-                        pkt_ethernet.src = self.router_ports[dpid][out_port]
+                    if apply_mask(pkt_ipv4.dst) in self.ip_to_mac[dpid].keys():
+                        out_port = self.ip_to_port[dpid][apply_mask(pkt_ipv4.dst)]
+                        pkt_ethernet.src = self.router_ports_mac[dpid][out_port]
                         pkt_ethernet.dst = self.ip_to_mac[dpid][pkt_ipv4.dst]
                         self.send_packet(msg.datapath,out_port,pkt)
                         return
@@ -148,9 +227,9 @@ class SwitchL3(app_manager.RyuApp):
 
 
     def send_arp_request(self, msg, pkt_ipv4):
-        out_port = self.ip_to_port[pkt_ipv4.dst]
-        src_mac = self.router_ports[msg.datapath.id][out_port]
-        src_ip = self.router_ports_to_ip[out_port]
+        out_port = self.ip_to_port[apply_mask(pkt_ipv4.dst)]
+        src_mac = self.router_ports_mac[msg.datapath.id][out_port]
+        src_ip = self.router_ports_to_ip[msg.datapath.id][out_port]
 
 
         pkt = packet.Packet()
@@ -186,11 +265,11 @@ class SwitchL3(app_manager.RyuApp):
         #ARP packet handling.
         dpid = msg.datapath.id
 
-        if pkt_arp.dst_ip in self.router_ports_to_ip.values() and pkt_arp.opcode == arp.ARP_REQUEST:
+        if pkt_arp.dst_ip in self.router_ports_to_ip[dpid].values() and pkt_arp.opcode == arp.ARP_REQUEST:
 
             self.logger.info("\nARP Request received by router %s from %s in port %s ", dpid, pkt_arp.src_ip, port)
 
-            port_mac = self.router_ports[dpid][port]
+            port_mac = self.router_ports_mac[dpid][port]
 
             pkt = packet.Packet()
             pkt.add_protocol(ethernet.ethernet(ethertype=ether.ETH_TYPE_ARP,
@@ -207,7 +286,7 @@ class SwitchL3(app_manager.RyuApp):
 
             return
 
-        elif pkt_arp.dst_ip in self.router_ports_to_ip.values() and pkt_arp.opcode == arp.ARP_REPLY:
+        elif pkt_arp.dst_ip in self.router_ports_to_ip[dpid].values() and pkt_arp.opcode == arp.ARP_REPLY:
             self.logger.info("\nARP Reply received by router %s from %s with MAC %s", dpid, pkt_arp.src_ip, pkt_arp.src_mac)
             self.ip_to_mac.setdefault(dpid, {})
             self.ip_to_mac[dpid][pkt_arp.src_ip] = pkt_arp.src_mac
@@ -217,13 +296,13 @@ class SwitchL3(app_manager.RyuApp):
                 pkt = packet.Packet(m.data)
                 pkt_eth = pkt.get_protocol(ethernet.ethernet)
                 pkt_v4 = pkt.get_protocol(ipv4.ipv4)
-                out_port = self.ip_to_port[pkt_arp.src_ip]
-                pkt_eth.src = self.router_ports[dpid][out_port]
+                out_port = self.ip_to_port[dpid][apply_mask(pkt_arp.src_ip)]
+                pkt_eth.src = self.router_ports_mac[dpid][out_port]
                 pkt_eth.dst = self.ip_to_mac[dpid][pkt_arp.src_ip]
                 self.send_packet(msg.datapath,out_port,pkt)
                 self.logger.info("Router %s sent queued packet from %s to %s", dpid, pkt_v4.src, pkt_v4.dst)
 
-  
+
             #cycle through all packets to this ip and forward them
             return
         else:
@@ -243,9 +322,9 @@ class SwitchL3(app_manager.RyuApp):
         pkt = packet.Packet()
         pkt.add_protocol(ethernet.ethernet(ethertype=pkt_ethernet.ethertype,
                                            dst=pkt_ethernet.src,
-                                           src=self.router_ports[dpid][port]))
+                                           src=self.router_ports_mac[dpid][port]))
         pkt.add_protocol(ipv4.ipv4(dst=pkt_ipv4.src,
-                                   src=self.router_ports_to_ip[port],
+                                   src=self.router_ports_to_ip[dpid][port],
                                    proto=pkt_ipv4.proto))
         pkt.add_protocol(icmp.icmp(type_=icmp.ICMP_ECHO_REPLY,
                                    code=icmp.ICMP_ECHO_REPLY_CODE,
@@ -255,7 +334,7 @@ class SwitchL3(app_manager.RyuApp):
         self.logger.info('Send ICMP echo reply to [%s].', src_ip)
 
 
-        '''match = parser.OFPMatch(in_port=port,
+        match = parser.OFPMatch(in_port=port,
                                 eth_type=0x0800,
                                 ip_proto=pkt_ipv4.proto,
                                 ipv4_src=pkt_ipv4.src,
@@ -263,6 +342,7 @@ class SwitchL3(app_manager.RyuApp):
 
         set_eth_src = parser.OFPActionSetField(eth_src=pkt_ethernet.dst)
         set_eth_dst = parser.OFPActionSetField(eth_dst=pkt_ethernet.src)
+        set_ip_proto = parser.OFPActionSetField(ip_proto=0x01)
         set_ip_src = parser.OFPActionSetField(ipv4_src=pkt_ipv4.dst)
         set_ip_dst = parser.OFPActionSetField(ipv4_dst=pkt_ipv4.src)
         set_icmp_type = parser.OFPActionSetField(icmpv4_type=0x00)
@@ -270,11 +350,11 @@ class SwitchL3(app_manager.RyuApp):
         
         self.add_flow(msg.datapath,2,match,actions)
 
-        self.logger.info('Added flow table entry!')'''
+        self.logger.info('Added flow table entry!')
 
 
     def send_icmp_unreachable(self, msg, port, pkt_ethernet, pkt_ipv4):
-        port_mac = self.router_ports[msg.datapath.id][port]
+        port_mac = self.router_ports_mac[msg.datapath.id][port]
 
         offset = ethernet.ethernet._MIN_LEN
         end_of_data = offset + len(pkt_ipv4) + 128
@@ -293,7 +373,7 @@ class SwitchL3(app_manager.RyuApp):
                                             dst=pkt_ethernet.src,
                                             src=port_mac))
         pkt.add_protocol(ipv4.ipv4(dst=pkt_ipv4.src,
-                                    src=self.router_ports_to_ip[port],
+                                    src=self.router_ports_to_ip[msg.datapath.id][port],
                                     proto=pkt_ipv4.proto))
         pkt.add_protocol(icmp.icmp(type_=icmp.ICMP_DEST_UNREACH,
                                     code=icmp.ICMP_HOST_UNREACH_CODE,
