@@ -1,3 +1,5 @@
+from turtle import update
+from matplotlib.cbook import ls_mapper
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
@@ -17,12 +19,8 @@ from ryu.ofproto import ether
 import time
 import threading
 
-ETHERNET = ethernet.ethernet.__name__
-IPV4 = ipv4.ipv4.__name__
-ARP = arp.arp.__name__
-ICMP = icmp.icmp.__name__
-TCP = tcp.tcp.__name__
-UDP = udp.udp.__name__
+#Set to true to use the firewall
+firewall = False
 
 def apply_mask(ip):
     ip = ip.split('.')
@@ -30,6 +28,24 @@ def apply_mask(ip):
 
     return ip
 
+def router_to_router(dpid,port):
+    if dpid == 17:
+        if port == 1:
+            dpid,port = 18,1
+        elif port == 2:
+            dpid,port = 19,2
+    elif dpid == 18:
+        if port == 1:
+            dpid,port = 17,1
+        elif port == 2:
+            dpid,port = 19,1
+    elif dpid == 19:
+        if port == 1:
+            dpid,port = 18,2
+        elif port == 2:
+            dpid,port = 17,1
+    
+    return dpid,port
 
 class SwitchL3(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -37,9 +53,9 @@ class SwitchL3(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(SwitchL3, self).__init__(*args, **kwargs)
         self.ip_to_mac = {}
-        self.ip_to_port = {17: {'10.0.1' : 3, '10.0.2' : 2, '10.0.3' : 2},
+        self.ip_to_port = {17: {'10.0.1' : 3, '10.0.2' : 1, '10.0.3' : 2},
                            18: {'10.0.1' : 1, '10.0.2' : 3, '10.0.3' : 2},
-                           19: {'10.0.1' : 1, '10.0.2' : 1, '10.0.3' : 3}}
+                           19: {'10.0.1' : 2, '10.0.2' : 1, '10.0.3' : 3}}
         self.router_ports_mac = {}
         self.router_ports_state = {}
         self.router_ports_to_ip = {17: {1 : '10.0.4.1', 2 : '10.0.6.2', 3 : '10.0.1.20'}, 
@@ -49,12 +65,37 @@ class SwitchL3(app_manager.RyuApp):
         self.packet_queue = {}
         self.links = {}
         self.fst = True
+        self.routersDP = []
+        t = threading.Thread(target=self.port_status_thread)
+        t.daemon = True
+        t.start()
+
+    def remove_table_flows(self, datapath):
+        match, instructions = datapath.ofproto_parser.OFPMatch(),[]
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        flow_mod = parser.OFPFlowMod(datapath, 0, 0, 0,
+                                    ofproto.OFPFC_DELETE, 0, 0,
+                                    1,
+                                    ofproto.OFPCML_NO_BUFFER,
+                                    ofproto.OFPP_ANY,
+                                    ofproto.OFPG_ANY, 0,
+                                    match, instructions)
+        datapath.send_msg(flow_mod)
+        self.logger.info(f"Deleted all flow mods in router {datapath.id}!\n")
+        
+        self.start_setup(datapath)
+    
 
     def resolve_paths(self):
         link12 = False
         link23 = False
         link31 = False
-        copydict = self.ip_to_port.copy()
+        l1 = []
+        for i in self.ip_to_port.values():
+            for ii in i.values():
+                l1.append(ii) 
+
         try:
             if self.router_ports_state[17][1] == 4 and self.router_ports_state[18][1] == 4:
                 link12 = True
@@ -86,50 +127,104 @@ class SwitchL3(app_manager.RyuApp):
             self.ip_to_port[17]['10.0.3'] = 2
             self.ip_to_port[19]['10.0.1'] = 2
 
-        changed = False
-        for k in copydict:
-            for key in copydict[k]:
-                if copydict[k][key] != self.ip_to_port[k][key]:
-                    changed = True
-                    break
-            if changed:
-                break
 
+        l2 = []
+        for i in self.ip_to_port.values():
+            for ii in i.values():
+                l2.append(ii) 
 
-        if changed or self.fst:
-            for k in self.ip_to_port.keys():
-                print(f"Router {k}")
-                for key in self.ip_to_port[k].keys():
-                    print(f"{key}.0 to port: {self.ip_to_port[k][key]}")
-                print("\n")
-            print("\n")
+        updated = True
+        if len(l1)== len(l2) and len(l1) == sum([1 for i, j in zip(l1, l2) if i == j]):
+            updated = False
+
+        if self.fst:
+            print("Topology known!")
             self.fst = False
+        if updated:
+            print("Topology changed!\n")
+            for dp in self.routersDP:
+                self.remove_table_flows(dp)
 
-    def threaaa(self, datapath):
+            
+
+    def port_status_thread(self):
         while True:
-            time.sleep(5)
-            self.port_desc(datapath)
+            for dp in self.routersDP:
+                self.port_desc(dp)
+            time.sleep(0.1)
+
+
+    def start_setup(self,datapath):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        if firewall:
+            #Block all traffic
+            match = parser.OFPMatch()
+            actions = []
+            self.add_flow(datapath, 0, match, actions)
+
+            actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+            #Allow ARP traffic
+            match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_ARP)
+            self.add_flow(datapath, 100, match, actions)
+
+            #Allow traffic to server from h6
+            match = parser.OFPMatch(eth_type=0x0800,
+                                    ip_proto=0x06,
+                                    ipv4_dst='10.0.1.1',
+                                    ipv4_src='10.0.2.3',
+                                    tcp_dst=5555)
+            self.add_flow(datapath, 10, match, actions)
+            
+            #Allow traffic to server from h9
+            match = parser.OFPMatch(eth_type=0x0800,
+                                    ip_proto=0x06,
+                                    ipv4_dst='10.0.1.1',
+                                    ipv4_src='10.0.3.3',
+                                    tcp_dst=5555)
+            self.add_flow(datapath, 10, match, actions)
+            
+            #Allow traffic to h6 from server
+            match = parser.OFPMatch(eth_type=0x0800,
+                                    ip_proto=0x06,
+                                    ipv4_dst='10.0.2.3',
+                                    ipv4_src='10.0.1.1',
+                                    tcp_src=5555)
+            self.add_flow(datapath, 10, match, actions)
+            
+            #Allow traffic to h9 from server
+            match = parser.OFPMatch(eth_type=0x0800,
+                                    ip_proto=0x06,
+                                    ipv4_dst='10.0.3.3',
+                                    ipv4_src='10.0.1.1',
+                                    tcp_src=5555)
+            self.add_flow(datapath, 10, match, actions)
+        else:
+            #Allow all traffic
+            match = parser.OFPMatch()
+            actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+            self.add_flow(datapath, 0, match, actions)
+
+        #Block IPv6 traffic
+        match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IPV6)
+        actions = []
+        self.add_flow(datapath, 1, match, actions)
+
+        if firewall:
+            self.logger.info(f"Setting router {datapath.id} table to default (firewall)\n")
+        else:
+            self.logger.info(f"Setting router {datapath.id} table to default\n")
+
+
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
 
-        match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+        self.start_setup(datapath)
 
-        self.add_flow(datapath, 0, match, actions)
-
-        match = parser.OFPMatch(eth_type = ether_types.ETH_TYPE_IPV6)
-        actions = []
-
-        self.add_flow(datapath, 1, match, actions)
-
-        t = threading.Thread(target=self.threaaa,args=(datapath,))
-        t.daemon = True
-        t.start()
-
+        if datapath not in self.routersDP:
+            self.routersDP.append(datapath)
 
 
     def port_desc(self, datapath):
@@ -150,14 +245,8 @@ class SwitchL3(app_manager.RyuApp):
             self.router_ports_mac[dpid].update({p.port_no: p.hw_addr})
             self.router_ports_state[dpid].update({p.port_no: p.state})
 
-
         self.resolve_paths()
         
-        '''print("Router ",dpid)
-        for p in self.router_ports_mac[dpid].keys():
-            print(f"Port {p} has MAC {self.router_ports_mac[dpid][p]}")
-
-        print("\n")'''
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
@@ -175,9 +264,10 @@ class SwitchL3(app_manager.RyuApp):
         datapath.send_msg(mod)
  
 
-    #@set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
+        parser = msg.datapath.ofproto_parser
         dpid = msg.datapath.id        
         port = msg.match['in_port']
         pkt = packet.Packet(msg.data)
@@ -200,24 +290,51 @@ class SwitchL3(app_manager.RyuApp):
                     self.handle_icmp(msg, port, pkt_ethernet, pkt_ipv4, pkt_icmp)
                     return
             else:
-                #Static routing handling
+                #Routing handling
                 if apply_mask(pkt_ipv4.dst) in self.ip_to_port[dpid].keys():
+                    out_port = self.ip_to_port[dpid][apply_mask(pkt_ipv4.dst)]
                     self.logger.info("\nPacket received by router %s from %s to %s ", dpid, pkt_ipv4.src, pkt_ipv4.dst)
                     self.ip_to_mac.setdefault(dpid, {})
-                    if apply_mask(pkt_ipv4.dst) in self.ip_to_mac[dpid].keys():
-                        out_port = self.ip_to_port[dpid][apply_mask(pkt_ipv4.dst)]
-                        pkt_ethernet.src = self.router_ports_mac[dpid][out_port]
-                        pkt_ethernet.dst = self.ip_to_mac[dpid][pkt_ipv4.dst]
-                        self.send_packet(msg.datapath,out_port,pkt)
-                        return
+                    if out_port == 3:
+                        if pkt_ipv4.dst in self.ip_to_mac[dpid].keys():
+                            pkt_ethernet.src = self.router_ports_mac[dpid][out_port]
+                            pkt_ethernet.dst = self.ip_to_mac[dpid][pkt_ipv4.dst]
+                            self.send_packet(msg.datapath,out_port,pkt)
 
+                            match = parser.OFPMatch(eth_type=0x0800,
+                                                    ip_proto=pkt_ipv4.proto,
+                                                    ipv4_dst=pkt_ipv4.dst,
+                                                    ipv4_src=pkt_ipv4.src)
+                            actions = [parser.OFPActionSetField(eth_dst=pkt_ethernet.dst),
+                                       parser.OFPActionSetField(eth_src=pkt_ethernet.src),
+                                       parser.OFPActionOutput(out_port)]
+                            self.add_flow(msg.datapath,5000,match,actions)
+                            self.logger.info('Added flow table entry!')
+                            return
+
+                        else:
+                            #Send ARP Request
+                            self.packet_queue.setdefault(dpid,{})
+                            self.packet_queue[dpid].setdefault(pkt_ipv4.dst,[])
+                            self.packet_queue[dpid][pkt_ipv4.dst].append(msg)
+                            self.logger.info("\nRouter %s doesn't know MAC of %s adding packet to queue", dpid, pkt_ipv4.dst)
+                            self.send_arp_request(msg, pkt_ipv4)
+                            return
                     else:
-                        #Send ARP Request
-                        self.packet_queue.setdefault(pkt_ipv4.dst,[])
-                        self.packet_queue[pkt_ipv4.dst].append(msg)
-                        self.logger.info("\nRouter %s doesn't know MAC of %s adding packet to queue", dpid, pkt_ipv4.dst)
-                        self.send_arp_request(msg, pkt_ipv4)
-                        return
+                        pkt_ethernet.src = self.router_ports_mac[dpid][out_port]
+                        d,p = router_to_router(dpid,out_port)
+                        pkt_ethernet.dst = self.router_ports_mac[d][p]
+                        self.send_packet(msg.datapath,out_port,pkt)
+
+                        match = parser.OFPMatch(eth_type=0x0800,
+                                                ip_proto=pkt_ipv4.proto,
+                                                ipv4_dst=pkt_ipv4.dst,
+                                                ipv4_src=pkt_ipv4.src)
+                        actions = [parser.OFPActionSetField(eth_dst=pkt_ethernet.dst),
+                                    parser.OFPActionSetField(eth_src=pkt_ethernet.src),
+                                    parser.OFPActionOutput(out_port)]
+                        self.add_flow(msg.datapath,5000,match,actions)
+                        self.logger.info('Added flow table entry!')
 
                 else:
                     self.logger.info("\nPacket received by router %s from %s to %s (unknown destination)", dpid, pkt_ipv4.src, pkt_ipv4.dst)
@@ -227,9 +344,10 @@ class SwitchL3(app_manager.RyuApp):
 
 
     def send_arp_request(self, msg, pkt_ipv4):
-        out_port = self.ip_to_port[apply_mask(pkt_ipv4.dst)]
-        src_mac = self.router_ports_mac[msg.datapath.id][out_port]
-        src_ip = self.router_ports_to_ip[msg.datapath.id][out_port]
+        dpid = msg.datapath.id
+        out_port = self.ip_to_port[dpid][apply_mask(pkt_ipv4.dst)]
+        src_mac = self.router_ports_mac[dpid][out_port]
+        src_ip = self.router_ports_to_ip[dpid][out_port]
 
 
         pkt = packet.Packet()
@@ -244,7 +362,7 @@ class SwitchL3(app_manager.RyuApp):
 
         self.send_packet(msg.datapath,out_port,pkt)
 
-        self.logger.info("\nRouter %s sending ARP Request from port %s to learn MAC of %s", msg.datapath.id, out_port, pkt_ipv4.dst)
+        self.logger.info("\nRouter %s sending ARP Request from port %s to learn MAC of %s", dpid, out_port, pkt_ipv4.dst)
 
 
     def send_packet(self, datapath, port, pkt):
@@ -291,7 +409,7 @@ class SwitchL3(app_manager.RyuApp):
             self.ip_to_mac.setdefault(dpid, {})
             self.ip_to_mac[dpid][pkt_arp.src_ip] = pkt_arp.src_mac
 
-            for m in self.packet_queue[pkt_arp.src_ip]:
+            for m in self.packet_queue[dpid][pkt_arp.src_ip]:
                 dpid = m.datapath.id        
                 pkt = packet.Packet(m.data)
                 pkt_eth = pkt.get_protocol(ethernet.ethernet)
@@ -334,21 +452,21 @@ class SwitchL3(app_manager.RyuApp):
         self.logger.info('Send ICMP echo reply to [%s].', src_ip)
 
 
-        match = parser.OFPMatch(in_port=port,
-                                eth_type=0x0800,
+        match = parser.OFPMatch(eth_type=0x0800,
                                 ip_proto=pkt_ipv4.proto,
+                                ipv4_dst=pkt_ipv4.dst,
                                 ipv4_src=pkt_ipv4.src,
-                                ipv4_dst=pkt_ipv4.dst)
+                                icmpv4_type=0x08)
 
-        set_eth_src = parser.OFPActionSetField(eth_src=pkt_ethernet.dst)
-        set_eth_dst = parser.OFPActionSetField(eth_dst=pkt_ethernet.src)
-        set_ip_proto = parser.OFPActionSetField(ip_proto=0x01)
-        set_ip_src = parser.OFPActionSetField(ipv4_src=pkt_ipv4.dst)
-        set_ip_dst = parser.OFPActionSetField(ipv4_dst=pkt_ipv4.src)
-        set_icmp_type = parser.OFPActionSetField(icmpv4_type=0x00)
-        actions = [set_eth_src, set_eth_dst, set_ip_src, set_ip_dst, set_icmp_type, parser.OFPActionOutput(port)]
-        
-        self.add_flow(msg.datapath,2,match,actions)
+        actions = [parser.OFPActionSetField(ipv4_dst=pkt_ipv4.src),
+                   parser.OFPActionSetField(ipv4_src=pkt_ipv4.dst),
+                   parser.OFPActionSetField(eth_dst=pkt_ethernet.src),
+                   parser.OFPActionSetField(eth_src=pkt_ethernet.dst),
+                   parser.OFPActionSetField(icmpv4_type=0x00),
+                   parser.OFPActionSetField(icmpv4_code=0x00),
+                   parser.OFPActionOutput(msg.datapath.ofproto.OFPP_IN_PORT)]
+
+        self.add_flow(msg.datapath,5000,match,actions)
 
         self.logger.info('Added flow table entry!')
 

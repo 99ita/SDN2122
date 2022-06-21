@@ -11,17 +11,9 @@ from ryu.lib.packet import ethernet
 from ryu.lib.packet import icmp
 from ryu.lib.packet import ipv4
 from ryu.lib.packet import packet
-from ryu.lib.packet import packet_base
 from ryu.lib.packet import tcp
 from ryu.lib.packet import udp
 from ryu.ofproto import ether
-
-ETHERNET = ethernet.ethernet.__name__
-IPV4 = ipv4.ipv4.__name__
-ARP = arp.arp.__name__
-ICMP = icmp.icmp.__name__
-TCP = tcp.tcp.__name__
-UDP = udp.udp.__name__
 
 
 
@@ -99,6 +91,7 @@ class SwitchL3(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
+        parser = msg.datapath.ofproto_parser
         dpid = msg.datapath.id        
         port = msg.match['in_port']
         pkt = packet.Packet(msg.data)
@@ -130,6 +123,15 @@ class SwitchL3(app_manager.RyuApp):
                         pkt_ethernet.src = self.router_ports[dpid][out_port]
                         pkt_ethernet.dst = self.ip_to_mac[dpid][pkt_ipv4.dst]
                         self.send_packet(msg.datapath,out_port,pkt)
+                        match = parser.OFPMatch(eth_type=0x0800,
+                                                    ip_proto=pkt_ipv4.proto,
+                                                    ipv4_dst=pkt_ipv4.dst,
+                                                    ipv4_src=pkt_ipv4.src)
+                        actions = [parser.OFPActionSetField(eth_dst=pkt_ethernet.dst),
+                                    parser.OFPActionSetField(eth_src=pkt_ethernet.src),
+                                    parser.OFPActionOutput(out_port)]
+                        self.add_flow(msg.datapath,5000,match,actions)
+                        self.logger.info('Added flow table entry!')
                         return
 
                     else:
@@ -185,7 +187,6 @@ class SwitchL3(app_manager.RyuApp):
     def handle_arp(self, msg, port, pkt_ethernet, pkt_arp):
         #ARP packet handling.
         dpid = msg.datapath.id
-
         if pkt_arp.dst_ip in self.router_ports_to_ip.values() and pkt_arp.opcode == arp.ARP_REQUEST:
 
             self.logger.info("\nARP Request received by router %s from %s in port %s ", dpid, pkt_arp.src_ip, port)
@@ -202,7 +203,7 @@ class SwitchL3(app_manager.RyuApp):
                                  dst_mac=pkt_arp.src_mac,
                                  dst_ip=pkt_arp.src_ip))
             self.send_packet(msg.datapath, port, pkt)
-
+                    
             self.logger.info("ARP Reply sent by router %s from port %s with MAC %s to %s", dpid, port, port_mac, pkt_arp.src_ip)
 
             return
@@ -255,22 +256,24 @@ class SwitchL3(app_manager.RyuApp):
         self.logger.info('Send ICMP echo reply to [%s].', src_ip)
 
 
-        '''match = parser.OFPMatch(in_port=port,
-                                eth_type=0x0800,
-                                ip_proto=pkt_ipv4.proto,
-                                ipv4_src=pkt_ipv4.src,
-                                ipv4_dst=pkt_ipv4.dst)
-
-        set_eth_src = parser.OFPActionSetField(eth_src=pkt_ethernet.dst)
-        set_eth_dst = parser.OFPActionSetField(eth_dst=pkt_ethernet.src)
-        set_ip_src = parser.OFPActionSetField(ipv4_src=pkt_ipv4.dst)
-        set_ip_dst = parser.OFPActionSetField(ipv4_dst=pkt_ipv4.src)
-        set_icmp_type = parser.OFPActionSetField(icmpv4_type=0x00)
-        actions = [set_eth_src, set_eth_dst, set_ip_src, set_ip_dst, set_icmp_type, parser.OFPActionOutput(port)]
         
-        self.add_flow(msg.datapath,2,match,actions)
+        match = parser.OFPMatch(eth_type=0x0800,
+                                ip_proto=pkt_ipv4.proto,
+                                ipv4_dst=pkt_ipv4.dst,
+                                ipv4_src=pkt_ipv4.src,
+                                icmpv4_type=0x08)
 
-        self.logger.info('Added flow table entry!')'''
+        actions = [parser.OFPActionSetField(ipv4_dst=pkt_ipv4.src),
+                   parser.OFPActionSetField(ipv4_src=pkt_ipv4.dst),
+                   parser.OFPActionSetField(eth_dst=pkt_ethernet.src),
+                   parser.OFPActionSetField(eth_src=pkt_ethernet.dst),
+                   parser.OFPActionSetField(icmpv4_type=0x00),
+                   parser.OFPActionSetField(icmpv4_code=0x00),
+                   parser.OFPActionOutput(msg.datapath.ofproto.OFPP_IN_PORT)]
+
+        self.add_flow(msg.datapath,5000,match,actions)
+
+        self.logger.info('Added flow table entry!')
 
 
     def send_icmp_unreachable(self, msg, port, pkt_ethernet, pkt_ipv4):
